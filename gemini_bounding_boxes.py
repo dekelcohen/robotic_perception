@@ -115,6 +115,8 @@ if __name__ == "__main__":
     resp = call_gemini_rest(args.input, args.prompt)
     # Extract model's text markdown
     md = resp["candidates"][0]["content"]["parts"][0]["text"]
+    print('model response (text):',md)
+    # md = '```json[{"box_2d": [384, 755, 663, 1000], "label": "the golden sink"}]```'
     # Extract JSON array
     boxes = extract_json_from_text(md)
     # Draw and save
