@@ -1,219 +1,325 @@
-# conda activate env_woderfullteam
-# cd /d D:\NLP\Robotics\robotic_perception
-# gemini_bbox_demo.py
 # Demonstration of using Gemini API to detect objects and draw bounding boxes on an image.
+
+# conda activate env_woderfullteam
+  ## pip install google-genai opencv-python
+# cd /d D:\NLP\Robotics\robotic_perception
+# cd /d E:\Robotics\Robotics VLM\robotic_perception
+# command line:
+# --input "D:\Docs\test6\Projects\Robotics\Samples\Moley_Robot_Kitchen.jpg" --output ./outputs/Moley_Robot_Kitchen.jpg --prompt "Detect the closest  golden handle of the large pot (from obs pov) and return bounding boxes as [ymin, xmin, ymax, xmax] followed by label."
+
+
+
+# gemini_bbox_demo.py
+# Demonstration of using Gemini API (GenAI SDK with Vertex AI) to detect objects
+# and draw bounding boxes on an image, using the updated Google GenAI SDK API.
 
 import os
 import io
 import argparse
-from typing import List, Tuple, Union
+from typing import List, Tuple
 
+from pydantic import BaseModel
 import cv2
 import numpy as np
-from PIL import Image
-from google import genai
+from PIL import Image, ImageColor, ImageDraw
+import requests
 from dotenv import load_dotenv
+from google import genai
+from google.genai.types import (
+    GenerateContentConfig,
+    HttpOptions,
+    Part,
+    SafetySetting
+)
 
 # ----------------------------------------------------------------------------
 # Load environment variables from .env file
 # ----------------------------------------------------------------------------
 load_dotenv()
+os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "True")  # enable Vertex AI backend
+
+# ----------------------------------------------------------------------------
+# Pydantic model for structured response schema
+# ----------------------------------------------------------------------------
+class BoundingBox(BaseModel):
+    """
+    Represents a bounding box with normalized coordinates and label.
+    box_2d: [ymin, xmin, ymax, xmax] in 0-1000 scale
+    label: object label
+    """
+    box_2d: List[int]
+    label: str
 
 # ----------------------------------------------------------------------------
 # Function: init_client
-# Initializes the Gemini API client using an API key from environment variable.
-# Returns:
-#   genai.Client instance
+# Initializes the GenAI SDK client with Vertex AI settings.
 # ----------------------------------------------------------------------------
-def init_client(api_key_env: str = "GEMINI_API_KEY") -> genai.Client:
+def init_client() -> genai.Client:
     """
-    Initialize and return a Gemini API client.
-
-    Args:
-        api_key_env: Name of the environment variable holding your API key.
-
-    Returns:
-        genai.Client configured with your API key.
+    Initialize and return a Gemini (GenAI) client.
+    Requires GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION in env.
     """
-    api_key = os.getenv(api_key_env)
-    if not api_key:
-        raise ValueError(f"Environment variable '{api_key_env}' not set. Please add it to your .env file.")
-    return genai.Client(api_key=api_key)
+    #project = os.getenv("GOOGLE_CLOUD_PROJECT")
+    #location = os.getenv("GOOGLE_CLOUD_LOCATION", "global")
+    #if not project:
+    #    raise ValueError("Set GOOGLE_CLOUD_PROJECT in .env to your GCP project ID.")
+    # HTTP options config for GenAI SDK
+    #http_opts = HttpOptions(api_version="v1")
+    #return genai.Client(http_options=http_opts)
+    return genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
 
 # ----------------------------------------------------------------------------
-# Function: load_image_bytes
-# Loads an image from a file path into raw bytes.
-# Returns:
-#   BytesIO containing the image data.
+# Function: generate_config
+# Builds GenerateContentConfig with safety and schema.
 # ----------------------------------------------------------------------------
-def load_image_bytes(image_path: str) -> io.BytesIO:
+def generate_config() -> GenerateContentConfig:
     """
-    Read an image file and return an in-memory bytes buffer.
-
-    Args:
-        image_path: Path to the image file.
-
-    Returns:
-        io.BytesIO containing the image data.
+    Return content configuration: system instructions, safety, JSON schema.
     """
-    with open(image_path, "rb") as f:
-        img_bytes = f.read()
-    return io.BytesIO(img_bytes)
+    schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "box_2d": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4},
+                "label": {"type": "string"}
+            },
+            "required": ["box_2d", "label"]
+        }
+    }
+    return GenerateContentConfig(
+        system_instruction="""
+        Return bounding boxes as JSON array of {box_2d:[ymin,xmin,ymax,xmax], label}.
+        Limit to 25 objects. Do not return masks.
+        """,
+        temperature=0.0,
+        safety_settings=[
+            SafetySetting(
+                category="HARM_CATEGORY_DANGEROUS_CONTENT",
+                threshold="BLOCK_ONLY_HIGH"
+            )
+        ],
+        response_mime_type="application/json",
+        response_schema=schema
+    )
 
 # ----------------------------------------------------------------------------
 # Function: detect_bounding_boxes
-# Sends the image and prompt to Gemini API and retrieves bounding box response.
-# Returns:
-#   Raw response from the API.
+# Calls the GenAI SDK to detect objects and return parsed BoundingBox objects.
 # ----------------------------------------------------------------------------
 def detect_bounding_boxes(
     client: genai.Client,
-    image_input: Union[io.BytesIO, str],
+    image_path: str,
     prompt: str
-) -> List[str]:
+) -> List[BoundingBox]:
     """
-    Call Gemini generate_content to detect objects and bounding boxes.
+    Send image and prompt to GenAI SDK and parse JSON bounding boxes.
 
     Args:
-        client: Initialized Gemini API client.
-        image_input: Either a BytesIO buffer or a file reference string.
-        prompt: Instruction prompt asking for bounding boxes.
+        client: Initialized GenAI client
+        image_path: Local path to image file
+        prompt: Instruction for object detection
 
     Returns:
-        List of raw string lines with bounding box data.
+        List of BoundingBox instances
     """
-    inputs = [image_input, prompt]
-    response = client.models.generate_content(inputs)
-    # Assume response.content is a single string with newline-separated entries
-    return response.content.splitlines()
+    # Read bytes and wrap in Part
+    with open(image_path, "rb") as f:
+        img_bytes = f.read()
+        
+    part = Part.from_bytes(
+        data=img_bytes,
+        mime_type="image/jpeg"
+    )
+
+    config = generate_config()
+    response = client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=[part, prompt],
+        config=config
+    )
+    # response.parsed is List[BoundingBox]
+    return response.parsed  # type: ignore
 
 # ----------------------------------------------------------------------------
-# Function: parse_boxes
-# Parses raw API lines of the form:
-#   "[ymin, xmin, ymax, xmax] label"
-# into structured data.
-# Returns:
-#   List of (box, label)
+# Function: plot_bounding_boxes
+# Draws bounding boxes on image using PIL and shows or saves it.
 # ----------------------------------------------------------------------------
-def parse_boxes(raw_lines: List[str]) -> List[Tuple[List[float], str]]:
-    """
-    Convert API string lines into numeric bounding boxes and labels.
-
-    Args:
-        raw_lines: List of strings from the API response.
-
-    Returns:
-        List of tuples (box_coords, label), where box_coords is [ymin, xmin, ymax, xmax].
-    """
-    parsed = []
-    for line in raw_lines:
-        try:
-            # Remove brackets and split
-            coords_str, label = line.strip().split(']')
-            coords = coords_str.lstrip('[').split(',')
-            box = [float(c) for c in coords]
-            parsed.append((box, label.strip()))
-        except Exception:
-            # Skip unparseable lines
-            continue
-    return parsed
-
-# ----------------------------------------------------------------------------
-# Function: normalize_to_pixels
-# Converts a normalized 0-1000 box to pixel coordinates for a given image size.
-# Returns:
-#   Tuple of (x1, y1, x2, y2)
-# ----------------------------------------------------------------------------
-def normalize_to_pixels(
-    box: List[float],
-    image_size: Tuple[int, int]
-) -> Tuple[int, int, int, int]:
-    """
-    Scale a [ymin, xmin, ymax, xmax] box from 0-1000 space to pixels.
-
-    Args:
-        box: Normalized coordinates [ymin, xmin, ymax, xmax].
-        image_size: (width, height) of the image in pixels.
-
-    Returns:
-        (x1, y1, x2, y2) pixel coordinates.
-    """
-    ymin, xmin, ymax, xmax = box
-    width, height = image_size
-    x1 = int(xmin / 1000 * width)
-    y1 = int(ymin / 1000 * height)
-    x2 = int(xmax / 1000 * width)
-    y2 = int(ymax / 1000 * height)
-    return x1, y1, x2, y2
-
-# ----------------------------------------------------------------------------
-# Function: draw_boxes
-# Draws bounding boxes and labels on an image and saves the output.
-# ----------------------------------------------------------------------------
-def draw_boxes(
-    input_path: str,
-    boxes_labels: List[Tuple[List[float], str]],
-    output_path: str
+def plot_bounding_boxes(
+    image_path: str,
+    boxes: List[BoundingBox],
+    output_path: str = None
 ) -> None:
     """
-    Open an image, draw bounding boxes with labels, and save to disk.
+    Draws colored boxes with labels on the image.
 
     Args:
-        input_path: Path to the source image file.
-        boxes_labels: List of tuples ([ymin, xmin, ymax, xmax], label).
-        output_path: Path to save the annotated image.
+        image_path: Local path or URL
+        boxes: List of BoundingBox
+        output_path: If set, saves annotated image
     """
-    # Load image with OpenCV
-    img = cv2.imread(input_path)
-    if img is None:
-        raise FileNotFoundError(f"Unable to load image '{input_path}'")
+    # Load image
+    if image_path.startswith("http"):
+        im = Image.open(requests.get(image_path, stream=True).raw)
+    else:
+        im = Image.open(image_path)
+    width, height = im.size
+    draw = ImageDraw.Draw(im)
+    colors = list(ImageColor.colormap.keys())
 
-    height, width = img.shape[:2]
-    
-    for box, label in boxes_labels:
-        x1, y1, x2, y2 = normalize_to_pixels(box, (width, height))
-        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(
-            img,
-            label,
-            (x1, y1 - 10),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA
-        )
-    cv2.imwrite(output_path, img)
+    for idx, bb in enumerate(boxes):
+        ymin, xmin, ymax, xmax = bb.box_2d
+        x1 = int(xmin / 1000 * width)
+        y1 = int(ymin / 1000 * height)
+        x2 = int(xmax / 1000 * width)
+        y2 = int(ymax / 1000 * height)
+        color = colors[idx % len(colors)]
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+        draw.text((x1 + 4, y1 + 4), bb.label, fill=color)
+
+    if output_path:
+        im.save(output_path)
+        print(f"Annotated image saved to {output_path}")
+    else:
+        im.show()
+
 
 # ----------------------------------------------------------------------------
-# Main Execution
-# Parses arguments, runs detection, and outputs the result image.
+# Main Execution: CLI
 # ----------------------------------------------------------------------------
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Gemini API Bounding Box Demo")
-    parser.add_argument("--input", required=True, help="Path to input image file.")
-    parser.add_argument("--output", required=True, help="Path to save annotated image.")
+if False and __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Gemini GenAI Bounding Box Demo")
+    parser.add_argument("--input", required=True, help="Path or URL to input image.")
+    parser.add_argument("--output", help="Path to save annotated image.")
     parser.add_argument(
         "--prompt",
-        default="Detect all objects and return bounding boxes as [ymin, xmin, ymax, xmax] followed by label.",
-        help="Prompt for Gemini API."
+        default="Detect all objects and return bounding boxes as [ymin, xmin, ymax, xmax] with label.",
+        help="Prompt for GenAI SDK."
     )
     args = parser.parse_args()
 
-    # Initialize client and load image bytes
     client = init_client()
-    img_buf = load_image_bytes(args.input)
-
-    # Detect boxes
-    raw = detect_bounding_boxes(client, img_buf, args.prompt)
-    parsed = parse_boxes(raw)
-
-    # Draw and save
-    draw_boxes(args.input, parsed, args.output)
-
-    print(f"Annotated image saved to {args.output}")
+    boxes = detect_bounding_boxes(client, args.input, args.prompt)
+    plot_bounding_boxes(args.input, boxes, args.output)
 
 # ----------------------------------------------------------------------------
 # .env file example:
-# GEMINI_API_KEY=your_api_key_here
+# GOOGLE_CLOUD_PROJECT=your-project-id
+# GOOGLE_CLOUD_LOCATION=global
+# GEMINI_API_KEY=not-used-with-VertexAI
 # ----------------------------------------------------------------------------
+
+
+##### ============================= Rest service Gemini =====================================================================
+
+# gemini_rest_bbox.py
+# REST-based demo using Gemini API key to detect objects and draw bounding boxes.
+
+import os
+import argparse
+import base64
+import json
+import re
+import cv2
+import numpy as np
+import requests
+from PIL import ImageDraw, Image, ImageColor
+from dotenv import load_dotenv
+
+# ----------------------------------------------------------------------------
+# Load environment variables
+# ----------------------------------------------------------------------------
+load_dotenv()
+API_KEY = os.getenv("GEMINI_API_KEY")
+if not API_KEY:
+    raise RuntimeError("Missing GEMINI_API_KEY in environment.")
+
+# ----------------------------------------------------------------------------
+# Function: call_gemini_rest
+# Sends a POST request and returns full response JSON
+# ----------------------------------------------------------------------------
+def call_gemini_rest(image_path: str, prompt: str) -> dict:
+    with open(image_path, "rb") as f:
+        b64 = base64.b64encode(f.read()).decode("utf-8")
+    payload = {
+        "contents": [{
+            "parts": [
+                {"inline_data": {"mime_type": "image/jpeg", "data": b64}},
+                {"text": prompt}
+            ]
+        }]
+    }
+    url = (
+        "https://generativelanguage.googleapis.com/v1beta/"
+        "models/gemini-2.5-flash:generateContent"
+    )
+    resp = requests.post(url, params={"key": API_KEY}, json=payload)
+    resp.raise_for_status()
+    return resp.json()
+
+# ----------------------------------------------------------------------------
+# Function: extract_json_from_text
+# Finds a ```json ... ``` block in the given markdown text
+# ----------------------------------------------------------------------------
+def extract_json_from_text(md: str) -> list:
+    pattern = r"```json\s*(\[.*?\])\s*```"
+    match = re.search(pattern, md, re.DOTALL)
+    if not match:
+        raise ValueError("No JSON block found in model output")
+    return json.loads(match.group(1))
+
+# ----------------------------------------------------------------------------
+# Function: draw_boxes
+# Draws boxes on the image and saves output
+# ----------------------------------------------------------------------------
+def draw_boxes(image_path, boxes, output_path):
+    img = cv2.imread(image_path)
+    h, w = img.shape[:2]
+    colors = list(ImageColor.colormap.values())
+    pil_img = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_img)
+
+    for i, item in enumerate(boxes):
+        # Handle different item formats
+        if isinstance(item, dict):
+            coords = item.get("box_2d")
+            label = item.get("label", "")
+        elif isinstance(item, list) and len(item) >= 2:
+            coords, label = item[0], item[1]
+        else:
+            continue
+        # Draw if coords valid
+        if not coords or len(coords) != 4:
+            continue
+        ymin, xmin, ymax, xmax = coords
+        x1, y1 = int(xmin/1000*w), int(ymin/1000*h)
+        x2, y2 = int(xmax/1000*w), int(ymax/1000*h)
+        color = colors[i % len(colors)]
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=3)
+        if label:
+            draw.text((x1+4, y1+4), str(label), fill=color)
+
+    out_img = cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+    cv2.imwrite(output_path, out_img)
+
+# ----------------------------------------------------------------------------
+# Main CLI
+# ----------------------------------------------------------------------------
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Gemini REST Bounding Box Demo")
+    parser.add_argument("--input", required=True, help="Path to input image")
+    parser.add_argument("--output", required=True, help="Path to save annotated image")
+    parser.add_argument("--prompt", default="Return bounding boxes as [ymin, xmin, ymax, xmax] label", help="Detection prompt")
+    args = parser.parse_args()
+
+    # Call REST API
+    resp = call_gemini_rest(args.input, args.prompt)
+    # Extract model's text markdown
+    md = resp["candidates"][0]["content"]["parts"][0]["text"]
+    # Extract JSON array
+    boxes = extract_json_from_text(md)
+    # Draw and save
+    draw_boxes(args.input, boxes, args.output)
+    print(f"Annotated image saved to {args.output}")
+
