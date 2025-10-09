@@ -59,7 +59,7 @@ class CSRTTrackerProvider(TrackingProvider):
         if not ok:
             # If tracking fails, return last known bbox (initial for this simple impl)
             x1, y1, x2, y2 = self.initial_bbox_pixels
-            return [int(x1), int(y1), int(x2), int(y2)]
+            return ok, [0,1,0,1] # Special sent for failure to track - policies should be trained with this 
 
         x, y, w, h = bb
         x1 = int(round(x))
@@ -76,4 +76,4 @@ class CSRTTrackerProvider(TrackingProvider):
         if x2 <= x1: x2 = min(W - 1, x1 + 1)
         if y2 <= y1: y2 = min(H - 1, y1 + 1)
         self.initial_bbox_pixels = [x1, y1, x2, y2]  # update last known
-        return [x1, y1, x2, y2]
+        return ok, [x1, y1, x2, y2]

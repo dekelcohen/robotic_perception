@@ -5,7 +5,7 @@ conda create -n dl_310 -y python=3.10
 
 pip install lerobot torch pillow requests huggingface_hub[hf_xet] ipython
 # moondream bbox and pointing
-pip install moondream
+pip install moondream opencv-contrib-python
 
 * Problem: crash related to .mp4 decoding using torchcodec and ffmpeg 
   Workaround: pip unintall torchcodec
@@ -201,7 +201,9 @@ def process_frame(frame, object_prompt, bbox=None, bbox_provider=None, tracker=N
     else:
         # Track
         if tracker:
-            new_bbox = tracker.update(frame)
+            ok, new_bbox = tracker.update(frame)
+            if not ok:
+                print('Tracker failed - last bbox:', new_bbox)
 
     annotated_frame = frame
     if annotate and new_bbox:
