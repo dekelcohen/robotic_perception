@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""
+r"""
 * First time
 conda create -n dl_310 -y python=3.10
 
@@ -28,14 +28,14 @@ Usage:
     Optional: --out <annotated_image_path> --out-dataset <modified_dataset_dir>
     
     Example (WSL):
-       python /mnt/d/Docs/test6/Projects/Robotics/FeatureEng_Markers/convert_lerobot_dataset_to_bbox.py --repo_id Shani123/pickup_cup_1 --camera observation.images.table --object-prompt "red cup" --out_repo_id Shani123/pickup_cup_1_bbox_no_cam
+       python convert_lerobot_dataset_to_bbox.py --repo_id Shani123/pickup_cup_1 --camera observation.images.table --object-prompt "red cup" --out_repo_id Shani123/pickup_cup_1_bbox_no_cam
        
     Example (Windows):
     
-        cd /d  D:\Docs\test6\Projects\Robotics\FeatureEng_Markers
+        cd /d  D:\NLP\Robotics\robotic_perception\features_markers # laptop
         # Full example with bbox, tracker, annotated images, and upload to Hugging Face
-        python -m convert_lerobot_dataset_to_bbox --repo_id  lerobot/svla_so100_pickplace --camera observation.images.wrist --object-prompt "orange cube" --bbox-detector moondream --tracker csrt --annotate-image true --out-repo-id svla_so_100_pickplace_bbox_test --upload-out-repo overwrite
-
+        python -m convert_lerobot_dataset_to_bbox --repo_id  lerobot/svla_so100_pickplace --camera observation.images.top --object-prompt "orange cube" --bbox-detector moondream --tracker csrt --annotate-image true --out-repo-id svla_so_100_pickplace_bbox_test --upload-out-repo overwrite
+        # For testing, remove --upload-out-repo overwrite and add --max-episodes 1
         # test moondream object detector on first frame (do not convert the whole dataset)
         python -m convert_lerobot_dataset_to_bbox --repo_id  Shani123/pickup_toothpicks_2_plus_recovery --camera observation.images.table --object-prompt "jar with blue cap" --bbox-detector moondream
         # Add --out-repo-id Shani123/pickup_toothpicks_2_plus_recovery_bbox_no_cam to convert the dataset
@@ -51,7 +51,6 @@ import os
 from pathlib import Path
 import sys
 import argparse
-import base64
 import json
 import re
 from io import BytesIO
@@ -177,6 +176,38 @@ def draw_bbox_and_save(image, bbox, out_path):
     print(f"Saved annotated image to {out_path}")
 
 
+def process_frame(frame, object_prompt, bbox=None, bbox_provider=None, tracker=None, annotate=False):
+    """
+    Processes a single frame to detect or track an object and optionally annotate the frame.
+
+    Args:
+        frame (PIL.Image): The input frame.
+        object_prompt (str): The prompt for the object to detect.
+        bbox (list, optional): The previously detected bounding box. If None, detection is performed.
+        bbox_provider: The bounding box provider for initial detection.
+        tracker: The tracker to update the bounding box.
+        annotate (bool): Whether to draw the bounding box on the frame.
+
+    Returns:
+        tuple: A tuple containing the annotated frame (or original if annotate=False) and the bounding box.
+    """
+    new_bbox = None
+    if bbox is None:
+        # Detect
+        if bbox_provider:
+            detections, _ = bbox_provider.detect(frame, object_prompt)
+            if detections:
+                new_bbox = detections[0]["box_pixels"]
+    else:
+        # Track
+        if tracker:
+            new_bbox = tracker.update(frame)
+
+    annotated_frame = frame
+    if annotate and new_bbox:
+        annotated_frame = draw_bbox_on_image(frame, tuple(new_bbox))
+
+    return annotated_frame, new_bbox
 
 
 def str2bool(v):
@@ -199,6 +230,7 @@ def add_bbox_and_remove_camera_features(
     camera_key_for_tracking: str | None = None,
     tracker_name: str = "none",
     annotate_images: bool = False,
+    max_episodes: int | None = None,  # Added parameter to limit episodes for testing
 ):
     """
     Load a LeRobotDataset, remove its camera features and save it as a new LeRobotDataset to disk.
@@ -211,6 +243,7 @@ def add_bbox_and_remove_camera_features(
             Defaults to None.
         keep_image_keys (list[str] | None, optional): A list of image/video keys to preserve.
             If None, all image/video features are removed. Defaults to None.
+        max_episodes (int, optional): Maximum number of episodes to convert (for testing). If None, converts all episodes.
     """
     # Load the source dataset
     src_dataset = LeRobotDataset(repo_id, root=root)
@@ -221,22 +254,21 @@ def add_bbox_and_remove_camera_features(
     video_keys = {k for k, v in src_dataset.features.items() if v.get("dtype") == "video"}
     media_keys = image_keys | video_keys
 
-    # If annotate_images is requested, keep all camera media keys (image + video)
-    if annotate_images:
-        keep_image_keys = sorted(media_keys | set(keep_image_keys))
-        print(f"Annotate images requested: will keep all media keys, and annotate only: {camera_key_for_tracking}")
-    else:
-        # Filter user-provided keys to image-only (since use_videos may be False below)
-        original = list(keep_image_keys)
-        keep_image_keys = sorted(set(keep_image_keys) & image_keys)
-        if set(original) != set(keep_image_keys):
-            print(f"Filtered keep-image-keys to image-only: {keep_image_keys}")
-
-    # Create a new dataset, preserving media keys as requested
+    # Determine which (single) video key should be re-encoded (only the annotated camera if it is a video)
+    annotated_video_keys = set()
+    if annotate_images and camera_key_for_tracking and camera_key_for_tracking in video_keys:
+        annotated_video_keys = set([camera_key_for_tracking])        
+        # If annotate_images is requested, keep the camera that is annotated, even if it wasn't specified in keep_image_keys
+        keep_image_keys = sorted(annotated_video_keys | set(keep_image_keys))
+        print(f"Annotate images requested: will keep and annotate: {camera_key_for_tracking}")
+   
+    # Cameras to keep but not annotate - skip writing frames (encode is slow) --> but copy their videos (much faster)
+    fast_copy_keys = set(keep_image_keys) - annotated_video_keys
+    # Create a new dataset, preserving camera keys of annotated cams. The rest of cams to keep will be added during video copy
     new_features = {
         key: value
         for key, value in src_dataset.features.items()
-        if (value["dtype"] not in ["image", "video"]) or (key in keep_image_keys)
+        if (value["dtype"] not in ["image", "video"]) or (key in annotated_video_keys)
     }
     new_features["observation.environment_state"] = {
         "dtype": "float32",
@@ -247,6 +279,8 @@ def add_bbox_and_remove_camera_features(
     # Enable video writing if we keep any video keys
     use_videos_out = any(k in video_keys for k in keep_image_keys)
 
+    print('LeRobotDataset.create(features) : ', new_features, '\nuse_videos_out=', use_videos_out)
+    
     dst_dataset = LeRobotDataset.create(
         new_repo_id,
         fps=src_dataset.fps,
@@ -269,11 +303,7 @@ def add_bbox_and_remove_camera_features(
             return int(x[0])
         return int(x)
 
-    # Determine which (single) video key should be re-encoded (only the annotated camera if it is a video)
-    annotated_video_key = None
-    if annotate_images and camera_key_for_tracking and camera_key_for_tracking in video_keys:
-        annotated_video_key = camera_key_for_tracking
-
+    
     # Precompute episode -> list of frame indices to avoid filtering the whole dataset per episode
     hf = src_dataset.hf_dataset
     episode_to_indices: dict[int, list[int]] = {}
@@ -281,8 +311,10 @@ def add_bbox_and_remove_camera_features(
         ep = int(row["episode_index"])
         episode_to_indices.setdefault(ep, []).append(i)
 
-    # Copy data from source to destination (single pass over indices)
+    episode_counter = 0  # new counter for episodes converted
     for episode_index in sorted(episode_to_indices.keys()):
+        if max_episodes is not None and episode_counter >= max_episodes:
+            break
         # If tracking is enabled, initialize a new tracker per episode
         tracker = None
         last_bbox = bbox_pixels
@@ -291,7 +323,7 @@ def add_bbox_and_remove_camera_features(
 
         for idx in episode_to_indices[episode_index]:
             frame = hf[idx]
-            frame_without_camera = {}
+            new_frame = {}
 
             # Copy non-media features only
             for key, value in frame.items():
@@ -299,9 +331,9 @@ def add_bbox_and_remove_camera_features(
                     if key in media_keys:
                         continue
                     if isinstance(value, torch.Tensor):
-                        frame_without_camera[key] = value.numpy()
+                        new_frame[key] = value.numpy()
                     else:
-                        frame_without_camera[key] = value
+                        new_frame[key] = value
 
             # Determine bbox for this frame (track over selected camera, if any)
             per_frame_bbox = bbox_pixels
@@ -309,7 +341,7 @@ def add_bbox_and_remove_camera_features(
             if tracking_enabled and camera_key_for_tracking in src_dataset.features:
                 try:
                     pil_tracked = tensor_to_pil(src_dataset[idx][camera_key_for_tracking])
-                    per_frame_bbox = tracker.update(pil_tracked)
+                    _, per_frame_bbox = process_frame(pil_tracked, None, bbox=last_bbox, tracker=tracker, annotate=False)
                     last_bbox = per_frame_bbox
                 except Exception:
                     per_frame_bbox = last_bbox
@@ -317,7 +349,7 @@ def add_bbox_and_remove_camera_features(
             # Write media frames:
             for mkey in keep_image_keys:
                 # Skip re-encoding for video keys unless this is the annotated video camera
-                if (mkey in video_keys) and (mkey != annotated_video_key):
+                if (mkey in video_keys) and not (mkey in annotated_video_keys):
                     continue
                 try:
                     # Reuse the already decoded tracked frame if this is the same camera
@@ -328,19 +360,20 @@ def add_bbox_and_remove_camera_features(
                     # Annotate only the specified camera key
                     if annotate_images and camera_key_for_tracking and mkey == camera_key_for_tracking:
                         pil_media = draw_bbox_on_image(pil_media, tuple(per_frame_bbox))
-                    frame_without_camera[mkey] = np.array(pil_media)
+                    new_frame[mkey] = np.array(pil_media)
                 except Exception:
                     # If decoding fails, skip this media key for this frame
                     pass
 
-            frame_without_camera["observation.environment_state"] = np.array(per_frame_bbox, dtype=np.float32)
+            new_frame["observation.environment_state"] = np.array(per_frame_bbox, dtype=np.float32)
 
             dst_dataset.add_frame(
-                frame_without_camera,
+                new_frame,
                 task=src_dataset.meta.tasks[_as_int(frame["task_index"])],
                 timestamp=float(frame["timestamp"][0] if isinstance(frame["timestamp"], (list, tuple, np.ndarray)) else getattr(frame["timestamp"], "item", lambda: frame["timestamp"])()),
             )
         dst_dataset.save_episode()
+        episode_counter += 1
         
     # Cleanup: remove intermediate images written for video keys (not needed in final repo)
     try:
@@ -357,6 +390,7 @@ def add_bbox_and_remove_camera_features(
         # Non-fatal: leave any residual images if cleanup fails
         pass
 
+    # TODO: Refactor to another function
     # Fast path: copy original videos for all kept video keys except the annotated (re-encoded) one
     if use_videos_out:
         try:
@@ -364,7 +398,7 @@ def add_bbox_and_remove_camera_features(
             dst_videos_root = Path(dst_dataset.root) / "videos"
             dst_videos_root.mkdir(parents=True, exist_ok=True)
             for vkey in (set(keep_image_keys) & video_keys):
-                if vkey == annotated_video_key:
+                if vkey in annotated_video_keyss:
                     continue  # this one was re-encoded
                 src_dir = src_videos_root / vkey
                 dst_dir = dst_videos_root / vkey
@@ -372,8 +406,24 @@ def add_bbox_and_remove_camera_features(
                     if dst_dir.exists():
                         shutil.rmtree(dst_dir, ignore_errors=True)
                     shutil.copytree(src_dir, dst_dir)
-            if annotated_video_key:
-                print(f"Re-encoded video for '{annotated_video_key}', copied originals for: {sorted((set(keep_image_keys) & video_keys) - {annotated_video_key})}")
+            # Path meta/info.json with cams to keep but not annotated (these were already added in above loop)
+            try:
+                src_meta = json.load(open(Path(src_dataset.root) / "meta" / "info.json"))
+                dst_meta_path = Path(dst_dataset.root) / "meta" / "info.json"
+                dst_meta = json.load(open(dst_meta_path))
+    
+                # Copy metadata for cameras we fast-copied
+                for vkey in fast_copy_keys:
+                    if vkey in src_meta.get("features", {}):
+                        dst_meta["features"][vkey] = src_meta["features"][vkey]
+    
+                # Save updated meta
+                json.dump(dst_meta, open(dst_meta_path, "w"), indent=2)
+                print(f"Patched meta/info.json with fast-copied camera keys: {sorted(fast_copy_keys)}")
+            except Exception as e:
+                print(f"Warning: failed to patch meta/info.json for fast-copied cameras: {e}")
+            if annotated_video_keys:
+                print(f"Re-encoded video for '{annotated_video_keys}', copied originals for: {sorted((set(keep_image_keys) & video_keys) - {annotated_video_keys})}")
             else:
                 print(f"Copied original videos for: {sorted(set(keep_image_keys) & video_keys)}")
         except Exception as _e:
@@ -455,6 +505,7 @@ def _upload_out_repo_if_requested(local_dir: str | Path, repo_id: str, mode: str
     print(f"Uploaded dataset to https://huggingface.co/datasets/{full_repo_id}")
 
 def main():
+    # TODO: Refactor args parsing to a function 
     p = argparse.ArgumentParser()
     p.add_argument("--repo_id", "-d", required=True, help="Hugging Face repo id or local path")
     p.add_argument("--camera", "-c", required=True, help="camera key to read from dataset.meta.camera_keys for extract first frame for bbox detection")
@@ -465,13 +516,15 @@ def main():
     p.add_argument("--tracker", default="none", choices=["none", "csrt"], help="Tracker to propagate bbox across frames.")
     p.add_argument("--out-repo-id", help="name of the new repo e.g Shani123/pick_up_glass_bbox. Saved in ")
     p.add_argument("--keep-image-keys", nargs='*', default=[], help="List of image/video keys to preserve in the output dataset.")
-    p.add_argument("--annotate-image", type=str2bool, default=False, help="If true, keep images and annotate them with the bbox in the output dataset.")
+    p.add_argument("--annotate-image", type=str2bool, default=False, help="If true, keep images and annotate them with the bbox in the output dataset video.")
     p.add_argument(
         "--upload-out-repo",
         default="false",
         choices=["false", "true", "overwrite"],
-        help="Upload the output dataset repo to Hugging Face. 'false' (default): do not upload; 'true': create and upload if not exists, otherwise skip; 'overwrite': upload to existing repo (overwrite matching files).",
+        help="Upload the output dataset repo to Hugging Face. 'false' (default): do not upload; 'true': create and upload if not exists, otherwise skip; 'overwrite': upload to existing repo (overwriting matching files).",
     )
+    p.add_argument("--max-episodes", type=int, default=None, 
+                   help="Max episodes to convert (for testing; if not provided, converts all episodes)")
     args = p.parse_args()
 
     # API key for object prompt extraction (always uses Gemini)
@@ -512,6 +565,7 @@ def main():
     img_bytes = img_buf.getvalue()
     mime_type = "image/jpeg"
 
+    # TODO: Refactor to a function: Gemini call to extract object prompt from task description
     # If --object-prompt "jar with blue cap" is not provided:
     # Given Task prompt (e.g place red bottle in the drawer) extract the main first object to interact with (red bottle)
     ## Call Object Detector to extract the bbox of the object 
@@ -551,6 +605,7 @@ def main():
     object_prompt = (object_prompt or "").strip().strip('"').strip("'")
     print(f"Object to detect: '{object_prompt}'")
 
+    # TODO: Refactor to a function: Instantiate bbox provider and call detect()
     # Instantiate and use the bounding box provider
     try:
         bbox_provider = get_bbox_provider(args.bbox_detector)
@@ -569,8 +624,10 @@ def main():
     print("Primary detection (rescaled to pixels):")
     print(json.dumps(primary, indent=2))
 
+    
     # 1) Save annotated image (requirement for first frame)
     out_path = args.out
+    # TODO: Refactor to a function: bbox_pixels normalization
     bbox_pixels = primary["box_pixels"]  # [x1, y1, x2, y2]
     x1_orig, y1_orig, x2_orig, y2_orig = bbox_pixels
     # Ensure coordinates are in the right order - min x, min y, max x, max y (draw requires it)
@@ -589,12 +646,7 @@ def main():
         except Exception as e:
             print(f"Warning: could not instantiate tracker '{args.tracker}': {e}")
 
-    # --- NEW: Add 'observation.environment_state' column (static or tracked bbox for all frames)
-    hf = getattr(ds, "hf_dataset", None)
-    if hf is None:
-        print("Warning: ds.hf_dataset not available; cannot write modified dataset. Exiting.")
-        sys.exit(0)
-
+    # 2) Convert the dataset to bboxes (if requested)
     if args.out_repo_id:    
         ds_new = add_bbox_and_remove_camera_features(
             repo_id=ds.root,
@@ -604,6 +656,7 @@ def main():
             camera_key_for_tracking=args.camera,
             tracker_name=args.tracker,
             annotate_images=args.annotate_image,
+            max_episodes=args.max_episodes  # pass the new cmdline argument
         )
         print(f"Done. Modified dataset includes 'observation.environment_state' and camera columns removed. Saved in {ds_new.root}")
         # Upload to HF if requested
@@ -613,4 +666,3 @@ def main():
 
 if __name__ == "__main__":    
     main()
-
