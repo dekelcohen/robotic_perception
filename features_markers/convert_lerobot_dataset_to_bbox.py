@@ -398,7 +398,7 @@ def add_bbox_and_remove_camera_features(
             dst_videos_root = Path(dst_dataset.root) / "videos"
             dst_videos_root.mkdir(parents=True, exist_ok=True)
             for vkey in (set(keep_image_keys) & video_keys):
-                if vkey in annotated_video_keyss:
+                if vkey in annotated_video_keys:
                     continue  # this one was re-encoded
                 src_dir = src_videos_root / vkey
                 dst_dir = dst_videos_root / vkey
