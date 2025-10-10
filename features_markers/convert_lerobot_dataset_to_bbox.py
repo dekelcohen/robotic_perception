@@ -47,6 +47,7 @@ Behavior (added/changed):
   - Saves modified dataset to disk with the path specified by --out-dataset.
 """
 
+import traceback
 import os
 from pathlib import Path
 import sys
@@ -176,40 +177,45 @@ def draw_bbox_and_save(image, bbox, out_path):
     print(f"Saved annotated image to {out_path}")
 
 
-def process_frame(frame, object_prompt, bbox=None, bbox_provider=None, tracker=None, annotate=False):
-    """
-    Processes a single frame to detect or track an object and optionally annotate the frame.
+class FrameProcessor:
+    def __init__(self, object_prompt, bbox_provider, tracker_provider=None):
+        self.object_prompt = object_prompt
+        self.bbox_provider = bbox_provider
+        self.tracker_provider = tracker_provider
 
-    Args:
-        frame (PIL.Image): The input frame.
-        object_prompt (str): The prompt for the object to detect.
-        bbox (list, optional): The previously detected bounding box. If None, detection is performed.
-        bbox_provider: The bounding box provider for initial detection.
-        tracker: The tracker to update the bounding box.
-        annotate (bool): Whether to draw the bounding box on the frame.
+    def process(self, frame, bbox=None, annotate=False):
+        """
+        Processes a single frame to detect or track an object and optionally annotate the frame.
 
-    Returns:
-        tuple: A tuple containing the annotated frame (or original if annotate=False) and the bounding box.
-    """
-    new_bbox = None
-    if bbox is None:
-        # Detect
-        if bbox_provider:
-            detections, _ = bbox_provider.detect(frame, object_prompt)
-            if detections:
-                new_bbox = detections[0]["box_pixels"]
-    else:
-        # Track
-        if tracker:
-            ok, new_bbox = tracker.update(frame)
-            if not ok:
-                print('Tracker failed - last bbox:', new_bbox)
+        Args:
+            frame (PIL.Image): The input frame.
+            bbox (list, optional): The previously detected bounding box. If None, detection is performed.
+            annotate (bool): Whether to draw the bounding box on the frame.
 
-    annotated_frame = frame
-    if annotate and new_bbox:
-        annotated_frame = draw_bbox_on_image(frame, tuple(new_bbox))
+        Returns:
+            tuple: A tuple containing the annotated frame (or original if annotate=False) and the bounding box.
+        """
+        new_bbox = None
+        if bbox is None:
+            # Detect
+            if self.bbox_provider:
+                detections, _ = self.bbox_provider.detect(frame, self.object_prompt)
+                if detections:
+                    new_bbox = detections[0]["box_pixels"]
+        else:
+            # Track
+            if self.tracker_provider:
+                ok, new_bbox = self.tracker_provider.update(frame)
+                if not ok:
+                    print('Tracker failed - last bbox:', new_bbox)
+            else:
+                new_bbox = bbox
 
-    return annotated_frame, new_bbox
+        annotated_frame = frame
+        if annotate and new_bbox:
+            annotated_frame = draw_bbox_on_image(frame, tuple(new_bbox))
+
+        return annotated_frame, new_bbox
 
 
 def str2bool(v):
@@ -227,6 +233,8 @@ def add_bbox_and_remove_camera_features(
     repo_id: str,
     new_repo_id: str,
     bbox_pixels: list[int],
+    object_prompt: str,
+    bbox_provider,
     root: str | Path | None = None,
     keep_image_keys: list[str] | None = None,
     camera_key_for_tracking: str | None = None,
@@ -318,10 +326,10 @@ def add_bbox_and_remove_camera_features(
         if max_episodes is not None and episode_counter >= max_episodes:
             break
         # If tracking is enabled, initialize a new tracker per episode
-        tracker = None
         last_bbox = bbox_pixels
+        frame_processor = FrameProcessor(object_prompt, bbox_provider=bbox_provider)
         if tracking_enabled:
-            tracker = _get_tracking_provider(tracker_name, bbox_pixels)
+            frame_processor.tracker_provider = _get_tracking_provider(tracker_name, bbox_pixels)
 
         for idx in episode_to_indices[episode_index]:
             frame = hf[idx]
@@ -343,7 +351,9 @@ def add_bbox_and_remove_camera_features(
             if tracking_enabled and camera_key_for_tracking in src_dataset.features:
                 try:
                     pil_tracked = tensor_to_pil(src_dataset[idx][camera_key_for_tracking])
-                    _, per_frame_bbox = process_frame(pil_tracked, None, bbox=last_bbox, tracker=tracker, annotate=False)
+                    pil_tracked, per_frame_bbox = frame_processor.process(
+                        pil_tracked, bbox=last_bbox, annotate=bool(annotated_video_keys)
+                    )
                     last_bbox = per_frame_bbox
                 except Exception:
                     per_frame_bbox = last_bbox
@@ -423,13 +433,15 @@ def add_bbox_and_remove_camera_features(
                 json.dump(dst_meta, open(dst_meta_path, "w"), indent=2)
                 print(f"Patched meta/info.json with fast-copied camera keys: {sorted(fast_copy_keys)}")
             except Exception as e:
-                print(f"Warning: failed to patch meta/info.json for fast-copied cameras: {e}")
-            if annotated_video_keys:
-                print(f"Re-encoded video for '{annotated_video_keys}', copied originals for: {sorted((set(keep_image_keys) & video_keys) - {annotated_video_keys})}")
+                print(f"Error: failed to patch meta/info.json for fast-copied cameras: {e}")
+                traceback.print_exc()
+            if len(annotated_video_keys):
+                print(f"Re-encoded video for '{annotated_video_keys}', copied originals for: {sorted((set(keep_image_keys) & video_keys) - annotated_video_keys)}")
             else:
                 print(f"Copied original videos for: {sorted(set(keep_image_keys) & video_keys)}")
         except Exception as _e:
-            print(f"Warning: failed to copy original videos: {_e}")
+            print(f"Error: failed to copy original videos: {_e}")
+            traceback.print_exc()
 
     return dst_dataset
 
@@ -654,6 +666,8 @@ def main():
             repo_id=ds.root,
             new_repo_id=args.out_repo_id,
             bbox_pixels=bbox_pixels,
+            object_prompt=object_prompt,
+            bbox_provider=bbox_provider,
             keep_image_keys=args.keep_image_keys,
             camera_key_for_tracking=args.camera,
             tracker_name=args.tracker,
