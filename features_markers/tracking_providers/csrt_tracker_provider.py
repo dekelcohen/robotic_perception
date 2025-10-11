@@ -5,8 +5,8 @@ from .tracking_providers import TrackingProvider
 class CSRTTrackerProvider(TrackingProvider):
     """OpenCV CSRT tracker provider (requires opencv-contrib-python)."""
 
-    def __init__(self, initial_bbox_pixels: list[int]):
-        super().__init__(initial_bbox_pixels)
+    def __init__(self):
+        super().__init__()
         self._cv2 = None
         self._tracker = None
         self._initialized = False
@@ -50,16 +50,15 @@ class CSRTTrackerProvider(TrackingProvider):
             self._initialized = True
             if not init_ok:
                 # If init fails, return initial bbox
-                return [int(x1), int(y1), int(x2), int(y2)]
+                return False, [int(x1), int(y1), int(x2), int(y2)]
 
         if cv2 is None:
             cv2 = self._cv2
         frame = self._pil_to_bgr(image)
         ok, bb = self._tracker.update(frame)
         if not ok:
-            # If tracking fails, return last known bbox (initial for this simple impl)
-            x1, y1, x2, y2 = self.initial_bbox_pixels
-            return ok, [0,1,0,1] # Special sent for failure to track - policies should be trained with this 
+            # If tracking fails, return a dummy bbox 
+            return ok, None # Special sent for failure to track - policies should be trained with this 
 
         x, y, w, h = bb
         x1 = int(round(x))

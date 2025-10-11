@@ -182,6 +182,7 @@ class FrameProcessor:
         self.object_prompt = object_prompt
         self.bbox_provider = bbox_provider
         self.tracker_provider = tracker_provider
+        self.before_first_bbox_detected = True
 
     def process(self, frame, bbox=None, annotate=False):
         """
@@ -196,12 +197,16 @@ class FrameProcessor:
             tuple: A tuple containing the annotated frame (or original if annotate=False) and the bounding box.
         """
         new_bbox = None
+        # If no bbox and the detector has not been called before - call detector. bbox can be None if tracker failed 
         if bbox is None:
             # Detect
-            if self.bbox_provider:
+            if self.bbox_provider and self.before_first_bbox_detected:
                 detections, _ = self.bbox_provider.detect(frame, self.object_prompt)
+                self.before_first_bbox_detected = False
                 if detections:
-                    new_bbox = detections[0]["box_pixels"]
+                    new_bbox = detections[0]["box_pixels"]                    
+                    if self.tracker_provider:
+                        self.tracker_provider.initial_bbox_pixels = new_bbox
         else:
             # Track
             if self.tracker_provider:
@@ -232,12 +237,11 @@ def str2bool(v):
 def add_bbox_and_remove_camera_features(
     repo_id: str,
     new_repo_id: str,
-    bbox_pixels: list[int],
     object_prompt: str,
     bbox_provider,
     root: str | Path | None = None,
     keep_image_keys: list[str] | None = None,
-    camera_key_for_tracking: str | None = None,
+    camera_key: str | None = None,
     tracker_name: str = "none",
     annotate_images: bool = False,
     max_episodes: int | None = None,  # Added parameter to limit episodes for testing
@@ -266,11 +270,11 @@ def add_bbox_and_remove_camera_features(
 
     # Determine which (single) video key should be re-encoded (only the annotated camera if it is a video)
     annotated_video_keys = set()
-    if annotate_images and camera_key_for_tracking and camera_key_for_tracking in video_keys:
-        annotated_video_keys = set([camera_key_for_tracking])        
+    if annotate_images and camera_key and camera_key in video_keys:
+        annotated_video_keys = set([camera_key])        
         # If annotate_images is requested, keep the camera that is annotated, even if it wasn't specified in keep_image_keys
         keep_image_keys = sorted(annotated_video_keys | set(keep_image_keys))
-        print(f"Annotate images requested: will keep and annotate: {camera_key_for_tracking}")
+        print(f"Annotate images requested: will keep and annotate: {camera_key}")
    
     # Cameras to keep but not annotate - skip writing frames (encode is slow) --> but copy their videos (much faster)
     fast_copy_keys = set(keep_image_keys) - annotated_video_keys
@@ -300,7 +304,7 @@ def add_bbox_and_remove_camera_features(
     )
 
     # Decide if tracking is enabled
-    tracking_enabled = (tracker_name is not None) and (tracker_name.lower() != "none") and bool(camera_key_for_tracking)
+    tracking_enabled = (tracker_name is not None) and (tracker_name.lower() != "none") and bool(camera_key)
     if tracking_enabled:
         from tracking_providers.tracking_provider_factory import get_tracking_provider as _get_tracking_provider
 
@@ -325,11 +329,11 @@ def add_bbox_and_remove_camera_features(
     for episode_index in sorted(episode_to_indices.keys()):
         if max_episodes is not None and episode_counter >= max_episodes:
             break
-        # If tracking is enabled, initialize a new tracker per episode
-        last_bbox = bbox_pixels
+        per_frame_bbox = None
         frame_processor = FrameProcessor(object_prompt, bbox_provider=bbox_provider)
+        # If tracking is enabled, initialize a new tracker per episode
         if tracking_enabled:
-            frame_processor.tracker_provider = _get_tracking_provider(tracker_name, bbox_pixels)
+            frame_processor.tracker_provider = _get_tracking_provider(tracker_name)
 
         for idx in episode_to_indices[episode_index]:
             frame = hf[idx]
@@ -346,38 +350,26 @@ def add_bbox_and_remove_camera_features(
                         new_frame[key] = value
 
             # Determine bbox for this frame (track over selected camera, if any)
-            per_frame_bbox = bbox_pixels
             pil_tracked = None
-            if tracking_enabled and camera_key_for_tracking in src_dataset.features:
+            if camera_key in src_dataset.features:
                 try:
-                    pil_tracked = tensor_to_pil(src_dataset[idx][camera_key_for_tracking])
+                    do_annotate = camera_key in annotated_video_keys
+                    pil_tracked = tensor_to_pil(src_dataset[idx][camera_key])
                     pil_tracked, per_frame_bbox = frame_processor.process(
-                        pil_tracked, bbox=last_bbox, annotate=bool(annotated_video_keys)
+                        pil_tracked, bbox=per_frame_bbox, annotate=do_annotate
                     )
-                    last_bbox = per_frame_bbox
-                except Exception:
-                    per_frame_bbox = last_bbox
+                    if do_annotate:
+                        new_frame[camera_key] = np.array(pil_tracked)
+        
+                except Exception as e:
+                    print(f"Error: failed to process frame: episode_index: {episode_index} frame_index: {idx}.\n{e}")
+                    traceback.print_exc()
 
-            # Write media frames:
-            for mkey in keep_image_keys:
-                # Skip re-encoding for video keys unless this is the annotated video camera
-                if (mkey in video_keys) and not (mkey in annotated_video_keys):
-                    continue
-                try:
-                    # Reuse the already decoded tracked frame if this is the same camera
-                    if pil_tracked is not None and mkey == camera_key_for_tracking:
-                        pil_media = pil_tracked
-                    else:
-                        pil_media = tensor_to_pil(src_dataset[idx][mkey])
-                    # Annotate only the specified camera key
-                    if annotate_images and camera_key_for_tracking and mkey == camera_key_for_tracking:
-                        pil_media = draw_bbox_on_image(pil_media, tuple(per_frame_bbox))
-                    new_frame[mkey] = np.array(pil_media)
-                except Exception:
-                    # If decoding fails, skip this media key for this frame
-                    pass
 
-            new_frame["observation.environment_state"] = np.array(per_frame_bbox, dtype=np.float32)
+            final_frame_bbox = per_frame_bbox
+            if final_frame_bbox is None:
+                final_frame_bbox = [0,0,0,0] # Keep the structre of bbox vector 4 dims (dummy bbox), even if no bbox
+            new_frame["observation.environment_state"] = np.array(final_frame_bbox, dtype=np.float32)
 
             dst_dataset.add_frame(
                 new_frame,
@@ -619,7 +611,7 @@ def main():
     object_prompt = (object_prompt or "").strip().strip('"').strip("'")
     print(f"Object to detect: '{object_prompt}'")
 
-    # TODO: Refactor to a function: Instantiate bbox provider and call detect()
+    # TODO: Refactor to a function test_bbox_detector_first_frame: Instantiate bbox provider and call detect()
     # Instantiate and use the bounding box provider
     try:
         bbox_provider = get_bbox_provider(args.bbox_detector)
@@ -665,11 +657,10 @@ def main():
         ds_new = add_bbox_and_remove_camera_features(
             repo_id=ds.root,
             new_repo_id=args.out_repo_id,
-            bbox_pixels=bbox_pixels,
             object_prompt=object_prompt,
             bbox_provider=bbox_provider,
             keep_image_keys=args.keep_image_keys,
-            camera_key_for_tracking=args.camera,
+            camera_key=args.camera,
             tracker_name=args.tracker,
             annotate_images=args.annotate_image,
             max_episodes=args.max_episodes  # pass the new cmdline argument
