@@ -37,8 +37,8 @@ class CSRTTrackerProvider(TrackingProvider):
             return arr
         return cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
 
-    def update(self, image: Image.Image) -> list[int]:
-        cv2 = None
+    def update(self, image: Image.Image) -> list[int]:        
+        cv2 = None        
         if not self._initialized:
             self._tracker = self._create_tracker()
             cv2 = self._cv2
@@ -48,9 +48,9 @@ class CSRTTrackerProvider(TrackingProvider):
             h = max(1, int(y2 - y1))
             init_ok = self._tracker.init(frame, (int(x1), int(y1), w, h))
             self._initialized = True
-            if not init_ok:
+            #if not init_ok: the tracker.init sometimes return None - so cannot know if succeeded 
                 # If init fails, return initial bbox
-                return False, [int(x1), int(y1), int(x2), int(y2)]
+            return True, [int(x1), int(y1), int(x2), int(y2)]
 
         if cv2 is None:
             cv2 = self._cv2

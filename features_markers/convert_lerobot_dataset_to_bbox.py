@@ -26,20 +26,20 @@ huggingface-cli login <search in auto_topics_tags.txt for complete with token>
 Usage:
     python detect_object_bbox.py --dataset <repo_or_local_path> --camera <camera_key> [--object-prompt "red mug"]
     Optional: --out <annotated_image_path> --out-dataset <modified_dataset_dir>
-    
-    Example (WSL):
-       python convert_lerobot_dataset_to_bbox.py --repo_id Shani123/pickup_cup_1 --camera observation.images.table --object-prompt "red cup" --out_repo_id Shani123/pickup_cup_1_bbox_no_cam
-       
-    Example (Windows):
-    
+           
+    Example (Windows):    
         cd /d  D:\NLP\Robotics\robotic_perception\features_markers # laptop
             cd /d  E:\Robotics\robotic_perception\features_markers # home
+        # Full example on current jar pick place dataset 
+        python -m convert_lerobot_dataset_to_bbox --repo_id Shani123/pick_place_jar_1 --camera observation.images.side --object-prompt "brown jar" --bbox-detector moondream --tracker csrt --out-repo-id Shani123/pick_place_jar_1_bbox --upload-out-repo overwrite --remove-episodes-no-detect    
         # Full example with bbox, tracker, annotated images, and upload to Hugging Face
         python -m convert_lerobot_dataset_to_bbox --repo_id  lerobot/svla_so100_pickplace --camera observation.images.top --object-prompt "orange cube" --bbox-detector moondream --tracker csrt --annotate-image true --out-repo-id svla_so_100_pickplace_bbox_test --upload-out-repo overwrite
         # For testing, remove --upload-out-repo overwrite and add --max-episodes 1
         # test moondream object detector on first frame (do not convert the whole dataset)
         python -m convert_lerobot_dataset_to_bbox --repo_id  Shani123/pickup_toothpicks_2_plus_recovery --camera observation.images.table --object-prompt "jar with blue cap" --bbox-detector moondream
         # Add --out-repo-id Shani123/pickup_toothpicks_2_plus_recovery_bbox_no_cam to convert the dataset
+        # Add --remove-episodes-no-detect to filter out episodes which the bbox-detector failed on their first frame !
+          # Note: If at mid episode the tracker fails --> the episode is not filtered out but bbox is [0,0,0,0] for all frames for the rest of episode
 Behavior (added/changed):
   - After obtaining a primary bounding box from Gemini, saves the annotated image (same as before).
   - Adds a new column 'observation.environment_state' to the dataset containing only {'bbox_pixels': [x1,y1,x2,y2]}
@@ -57,6 +57,7 @@ import json
 import re
 from io import BytesIO
 import shutil
+from dataclasses import dataclass
 
 import requests
 from PIL import Image, ImageDraw
@@ -66,7 +67,6 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import DEFAULT_FEATURES
 from bbox_providers.bbox_provider_factory import get_bbox_provider
 import torch
-
 
 
 # --- Gemini REST configuration ---
@@ -178,14 +178,22 @@ def draw_bbox_and_save(image, bbox, out_path):
     print(f"Saved annotated image to {out_path}")
 
 
+@dataclass
+class FrameProcessorOptions:
+    max_tracker_failed_saves: int = 5
+
 class FrameProcessor:
-    def __init__(self, object_prompt, bbox_provider, tracker_provider=None):
+    def __init__(self, object_prompt, bbox_provider, tracker_provider=None, options: FrameProcessorOptions = None):
+        if options is None:
+            options = FrameProcessorOptions()
         self.object_prompt = object_prompt
         self.bbox_provider = bbox_provider
         self.tracker_provider = tracker_provider
         self.before_first_bbox_detected = True
+        self.tracker_failed_save_count = 0
+        self.options = options
 
-    def process(self, frame, bbox=None, annotate=False):
+    def process(self, frame, bbox=None, annotate=False, info= { 'episode_index' : -1, 'frame_index' : -1 }):
         """
         Processes a single frame to detect or track an object and optionally annotate the frame.
 
@@ -198,7 +206,7 @@ class FrameProcessor:
             tuple: A tuple containing the annotated frame (or original if annotate=False) and the bounding box.
         """
         new_bbox = None
-        # If no bbox and the detector has not been called before - call detector. bbox can be None if tracker failed 
+        # If no bbox and the detector has not been called before - call detector. bbox can be None if tracker failed
         if bbox is None:
             # Detect
             if self.bbox_provider and self.before_first_bbox_detected:
@@ -214,6 +222,9 @@ class FrameProcessor:
                 ok, new_bbox = self.tracker_provider.update(frame)
                 if not ok:
                     print('Tracker failed - last bbox:', new_bbox)
+                    if self.tracker_failed_save_count < self.options.max_tracker_failed_saves:
+                        draw_bbox_and_save(frame, new_bbox, f'./tracker_failed_episode_{info["episode_index"]}_frame_{info["frame_index"]}.png')
+                        self.tracker_failed_save_count += 1
             else:
                 new_bbox = bbox
 
@@ -222,7 +233,6 @@ class FrameProcessor:
             annotated_frame = draw_bbox_on_image(frame, tuple(new_bbox))
 
         return annotated_frame, new_bbox
-
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -358,8 +368,9 @@ def add_bbox_and_remove_camera_features(
                 try:
                     do_annotate = camera_key in annotated_video_keys
                     pil_tracked = tensor_to_pil(src_dataset[idx][camera_key])
+                    info = { 'episode_index' : episode_index, 'frame_index' : idx }
                     pil_tracked, per_frame_bbox = frame_processor.process(
-                        pil_tracked, bbox=per_frame_bbox, annotate=do_annotate
+                        pil_tracked, bbox=per_frame_bbox, annotate=do_annotate, info=info
                     )
                     if do_annotate:
                         new_frame[camera_key] = np.array(pil_tracked)
