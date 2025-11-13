@@ -13,7 +13,7 @@ import lerobot.scripts.lerobot_record as original_record_script
 from lerobot.policies.factory import make_pre_post_processors as original_make_processors
 
 # Import the components needed for the check and injection
-from lerobot.processors.bbox_processor import BboxProcessorStep
+from my_lerobot.processors.bbox_processor import BboxProcessorStep
 
 
 def custom_make_processors_with_bbox_injection(*args, **kwargs):
