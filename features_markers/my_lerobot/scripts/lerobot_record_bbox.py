@@ -39,6 +39,7 @@ def custom_make_processors_with_bbox_injection(*args, **kwargs):
         logging.info(f"[MONKEY-PATCH] Loading BboxProcessorStep from: {bbox_config_path}")
         
         bbox_step = BboxProcessorStep.from_json(bbox_config_path)
+        
 
         # By injecting the step first, we add new observation data (e.g., bounding boxes)
         # before any other processing happens.        

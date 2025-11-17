@@ -28,6 +28,7 @@ from lerobot.utils.constants import OBS_ENV_STATE
 from bbox_providers.bbox_provider_factory import get_bbox_provider
 from convert_lerobot_dataset_to_bbox import (
     FrameProcessor,
+    FrameProcessorOptions,
     tensor_to_pil,
 )
 from tracking_providers.tracking_provider_factory import (
@@ -44,8 +45,7 @@ class BboxProcessorStep(ObservationProcessorStep):
     A processor step that uses a FrameProcessor to add bounding box information to the observation.
 
     This step extracts a specific camera image from the observation, passes it to a
-    FrameProcessor to get a bounding box for a target object, and adds the bounding
-box
+    FrameProcessor to get a bounding box for a target object, and adds the bounding box
     to the observation under the key "observation.environment_state".
 
     It can optionally replace the original camera image with an annotated version showing
@@ -73,8 +73,20 @@ box
         tracker_provider = None
         if self.tracker and self.tracker.lower() != "none":
             tracker_provider = get_tracking_provider(self.tracker)
-        self.frame_processor = FrameProcessor(self.object_prompt, bbox_provider, tracker_provider)
+        options = FrameProcessorOptions(max_tracker_failed_saves=1) # save one image when tracking fails during inference (episode=-1,frame=-1)
+        self.frame_processor = FrameProcessor(self.object_prompt, bbox_provider, tracker_provider, options)
         self.last_bbox = None
+
+    @classmethod
+    def from_json(cls, cfg: dict) -> "BboxProcessorStep":
+        """Instantiates a BboxProcessorStep from a JSON configuration."""
+        return cls(
+            camera_key=cfg["camera_key"],
+            object_prompt=cfg["object_prompt"],
+            bbox_detector=cfg["bbox_detector"],
+            tracker=cfg.get("tracker", "none"),
+            annotate_image=cfg.get("annotate_image", False),
+        )
 
     def observation(self, observation: dict[str, Tensor]) -> dict[str, Tensor]:
         """
@@ -112,7 +124,7 @@ box
             bbox_tensor = torch.zeros(4, dtype=torch.float32)
 
         # Add back the batch dimension for the environment state
-        observation[OBS_ENVIRONMENT_STATE] = bbox_tensor.unsqueeze(0)
+        observation[OBS_ENV_STATE] = bbox_tensor.unsqueeze(0)
         return observation
 
     def transform_features(
@@ -125,7 +137,7 @@ box
         if "observation" not in features:
             features["observation"] = {}
 
-        features["observation"][OBS_ENVIRONMENT_STATE] = {
+        features["observation"][OBS_ENV_STATE] = {
             "shape": (4,),
             "dtype": "float32",
             "name": ["y0", "x0", "y1", "x1"],
