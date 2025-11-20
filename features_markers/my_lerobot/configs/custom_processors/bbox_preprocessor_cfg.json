@@ -1,6 +1,6 @@
 {
-  "camera_key": "observation.image_primary",
-  "object_prompt": "the orange cube",
+  "camera_key": "observation.images.side",
+  "object_prompt": "brown jar",
   "bbox_detector": "moondream",
   "tracker": "csrt",
   "annotate_image": false

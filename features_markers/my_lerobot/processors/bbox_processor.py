@@ -15,6 +15,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+import json
 
 import numpy as np
 import torch
@@ -78,7 +79,7 @@ class BboxProcessorStep(ObservationProcessorStep):
         self.last_bbox = None
 
     @classmethod
-    def from_json(cls, cfg: dict) -> "BboxProcessorStep":
+    def from_cfg_dict(cls, cfg: dict) -> "BboxProcessorStep":
         """Instantiates a BboxProcessorStep from a JSON configuration."""
         return cls(
             camera_key=cfg["camera_key"],
@@ -87,6 +88,13 @@ class BboxProcessorStep(ObservationProcessorStep):
             tracker=cfg.get("tracker", "none"),
             annotate_image=cfg.get("annotate_image", False),
         )
+        
+    @classmethod
+    def from_json(cls, bbox_config_path: str) -> "BboxProcessorStep":
+        """Instantiates a BboxProcessorStep from a JSON configuration."""
+        with open(bbox_config_path, "r") as f:
+            dct_cfg = json.load(f)
+            return cls.from_cfg_dict(dct_cfg)
 
     def observation(self, observation: dict[str, Tensor]) -> dict[str, Tensor]:
         """
