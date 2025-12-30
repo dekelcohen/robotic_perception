@@ -30,16 +30,23 @@ class SAM3SegmentationProvider(ISegmentation):
             self._client = create_roboflow_client(api_url=self.api_url, api_key=self.api_key)
         return self._client
 
-    def segment(self, path_to_img: str, prompt_classes: List[str]) -> Any:
+    def segment(self, image_or_path, prompt_classes: List[str]) -> Any:
         client = self._client_lazy()
 
+        # Determine payload: path or in-memory
+        images_payload = {"image": image_or_path}
+
         # Minimal observability without introducing a logger dependency
-        print(f"SAM3: running workflow='{self.workflow_id}' on image='{path_to_img}' with classes={prompt_classes}")
+        try:
+            src_desc = image_or_path if isinstance(image_or_path, str) else f"{type(image_or_path).__name__}"
+        except Exception:
+            src_desc = "<image>"
+        print(f"SAM3: running workflow='{self.workflow_id}' on image='{src_desc}' with classes={prompt_classes}")
 
         response = client.run_workflow(
             workspace_name=self.workspace_name,
             workflow_id=self.workflow_id,
-            images={"image": path_to_img},
+            images=images_payload,
             parameters={"classes": list(prompt_classes) if prompt_classes else []},
             use_cache=self.use_cache,
         )

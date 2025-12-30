@@ -13,6 +13,7 @@ Requirements:
 """
 
 from typing import List
+from PIL import Image
 
 from features_markers.segmentation_providers.roboflow_helper import (
     create_roboflow_client,
@@ -31,10 +32,11 @@ def main():
     client = create_roboflow_client()
     provider = SAM3SegmentationProvider(client=client)
 
-    results = provider.segment(path_to_img=path_to_jpg, prompt_classes=prompt_classes)
+    # Load the image and pass the in-memory object to the provider
+    image = Image.open(path_to_jpg).convert("RGB")
+    results = provider.segment(image, prompt_classes=prompt_classes)
     print(results)
 
 
 if __name__ == "__main__":
     main()
-

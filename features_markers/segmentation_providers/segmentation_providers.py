@@ -11,12 +11,13 @@ class ISegmentation(ABC):
     """Abstract segmentation provider interface."""
 
     @abstractmethod
-    def segment(self, path_to_img: str, prompt_classes: List[str]) -> Any:
+    def segment(self, image_or_path: Any, prompt_classes: List[str]) -> Any:
         """
         Segment an image using text prompts and return provider-native results.
 
         Args:
-            path_to_img: Path to an input image file on disk.
+            image_or_path: Either a path to an image on disk (str) or an in-memory image
+                (e.g., PIL.Image.Image, bytes). Providers should handle both.
             prompt_classes: List of class prompts to segment (provider-specific semantics).
 
         Returns:
@@ -25,4 +26,3 @@ class ISegmentation(ABC):
             `np_mask` key with a decoded numpy binary mask.
         """
         raise NotImplementedError
-
