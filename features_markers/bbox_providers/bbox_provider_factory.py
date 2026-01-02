@@ -6,7 +6,7 @@ def get_bbox_provider(detector: str) -> BBoxProvider:
         from .gemini_bbox_provider import GeminiBBoxProvider
         return GeminiBBoxProvider()
     elif detector == "moondream":
-        from .moondream_bbox_provider import MoondreamBBoxProvider
-        return MoondreamBBoxProvider()
+        from .moondream_bbox_provider import MoondreamVLMProvider
+        return MoondreamVLMProvider()
     else:
         raise ValueError(f"Unknown bbox detector: {detector}")

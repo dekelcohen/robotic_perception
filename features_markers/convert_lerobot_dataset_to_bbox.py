@@ -26,19 +26,20 @@ huggingface-cli login <search in auto_topics_tags.txt for complete with token>
 Usage:
     python detect_object_bbox.py --dataset <repo_or_local_path> --camera <camera_key> [--object-prompt "red mug"]
     Optional: --out <annotated_image_path> --out-dataset <modified_dataset_dir>
-    
-    Example (WSL):
-       python convert_lerobot_dataset_to_bbox.py --repo_id Shani123/pickup_cup_1 --camera observation.images.table --object-prompt "red cup" --out_repo_id Shani123/pickup_cup_1_bbox_no_cam
-       
-    Example (Windows):
-    
+           
+    Example (Windows):    
         cd /d  D:\NLP\Robotics\robotic_perception\features_markers # laptop
+            cd /d  E:\Robotics\robotic_perception\features_markers # home
+        # Full example on current jar pick place dataset 
+        python -m convert_lerobot_dataset_to_bbox --repo_id Shani123/pick_place_jar_1 --camera observation.images.side --object-prompt "brown jar" --bbox-detector moondream --tracker csrt --out-repo-id Shani123/pick_place_jar_1_bbox --upload-out-repo overwrite --remove-episodes-no-detect    
         # Full example with bbox, tracker, annotated images, and upload to Hugging Face
         python -m convert_lerobot_dataset_to_bbox --repo_id  lerobot/svla_so100_pickplace --camera observation.images.top --object-prompt "orange cube" --bbox-detector moondream --tracker csrt --annotate-image true --out-repo-id svla_so_100_pickplace_bbox_test --upload-out-repo overwrite
         # For testing, remove --upload-out-repo overwrite and add --max-episodes 1
         # test moondream object detector on first frame (do not convert the whole dataset)
         python -m convert_lerobot_dataset_to_bbox --repo_id  Shani123/pickup_toothpicks_2_plus_recovery --camera observation.images.table --object-prompt "jar with blue cap" --bbox-detector moondream
         # Add --out-repo-id Shani123/pickup_toothpicks_2_plus_recovery_bbox_no_cam to convert the dataset
+        # Add --remove-episodes-no-detect to filter out episodes which the bbox-detector failed on their first frame !
+          # Note: If at mid episode the tracker fails --> the episode is not filtered out but bbox is [0,0,0,0] for all frames for the rest of episode
 Behavior (added/changed):
   - After obtaining a primary bounding box from Gemini, saves the annotated image (same as before).
   - Adds a new column 'observation.environment_state' to the dataset containing only {'bbox_pixels': [x1,y1,x2,y2]}
@@ -56,6 +57,7 @@ import json
 import re
 from io import BytesIO
 import shutil
+from dataclasses import dataclass
 
 import requests
 from PIL import Image, ImageDraw
@@ -65,7 +67,6 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from lerobot.datasets.utils import DEFAULT_FEATURES
 from bbox_providers.bbox_provider_factory import get_bbox_provider
 import torch
-
 
 
 # --- Gemini REST configuration ---
@@ -177,14 +178,22 @@ def draw_bbox_and_save(image, bbox, out_path):
     print(f"Saved annotated image to {out_path}")
 
 
+@dataclass
+class FrameProcessorOptions:
+    max_tracker_failed_saves: int = 5
+
 class FrameProcessor:
-    def __init__(self, object_prompt, bbox_provider, tracker_provider=None):
+    def __init__(self, object_prompt, bbox_provider, tracker_provider=None, options: FrameProcessorOptions = None):
+        if options is None:
+            options = FrameProcessorOptions()
         self.object_prompt = object_prompt
         self.bbox_provider = bbox_provider
         self.tracker_provider = tracker_provider
         self.before_first_bbox_detected = True
+        self.tracker_failed_save_count = 0
+        self.options = options
 
-    def process(self, frame, bbox=None, annotate=False):
+    def process(self, frame, bbox=None, annotate=False, info= { 'episode_index' : -1, 'frame_index' : -1 }):
         """
         Processes a single frame to detect or track an object and optionally annotate the frame.
 
@@ -197,7 +206,7 @@ class FrameProcessor:
             tuple: A tuple containing the annotated frame (or original if annotate=False) and the bounding box.
         """
         new_bbox = None
-        # If no bbox and the detector has not been called before - call detector. bbox can be None if tracker failed 
+        # If no bbox and the detector has not been called before - call detector. bbox can be None if tracker failed
         if bbox is None:
             # Detect
             if self.bbox_provider and self.before_first_bbox_detected:
@@ -213,6 +222,9 @@ class FrameProcessor:
                 ok, new_bbox = self.tracker_provider.update(frame)
                 if not ok:
                     print('Tracker failed - last bbox:', new_bbox)
+                    if self.tracker_failed_save_count < self.options.max_tracker_failed_saves:
+                        draw_bbox_and_save(frame, new_bbox, f'./tracker_failed_episode_{info["episode_index"]}_frame_{info["frame_index"]}.png')
+                        self.tracker_failed_save_count += 1
             else:
                 new_bbox = bbox
 
@@ -221,7 +233,6 @@ class FrameProcessor:
             annotated_frame = draw_bbox_on_image(frame, tuple(new_bbox))
 
         return annotated_frame, new_bbox
-
 
 def str2bool(v):
     if isinstance(v, bool):
@@ -245,6 +256,7 @@ def add_bbox_and_remove_camera_features(
     tracker_name: str = "none",
     annotate_images: bool = False,
     max_episodes: int | None = None,  # Added parameter to limit episodes for testing
+    remove_episodes_no_detect: bool = False,
 ):
     """
     Load a LeRobotDataset, remove its camera features and save it as a new LeRobotDataset to disk.
@@ -335,7 +347,8 @@ def add_bbox_and_remove_camera_features(
         if tracking_enabled:
             frame_processor.tracker_provider = _get_tracking_provider(tracker_name)
 
-        for idx in episode_to_indices[episode_index]:
+        skip_episode = False
+        for i, idx in enumerate(episode_to_indices[episode_index]):
             frame = hf[idx]
             new_frame = {}
 
@@ -355,8 +368,9 @@ def add_bbox_and_remove_camera_features(
                 try:
                     do_annotate = camera_key in annotated_video_keys
                     pil_tracked = tensor_to_pil(src_dataset[idx][camera_key])
+                    info = { 'episode_index' : episode_index, 'frame_index' : idx }
                     pil_tracked, per_frame_bbox = frame_processor.process(
-                        pil_tracked, bbox=per_frame_bbox, annotate=do_annotate
+                        pil_tracked, bbox=per_frame_bbox, annotate=do_annotate, info=info
                     )
                     if do_annotate:
                         new_frame[camera_key] = np.array(pil_tracked)
@@ -365,17 +379,28 @@ def add_bbox_and_remove_camera_features(
                     print(f"Error: failed to process frame: episode_index: {episode_index} frame_index: {idx}.\n{e}")
                     traceback.print_exc()
 
+            if i == 0 and per_frame_bbox is None and remove_episodes_no_detect:
+                print(f"Skipping episode {episode_index}: no bbox detected in the first frame.")
+                skip_episode = True                
+                break
+
 
             final_frame_bbox = per_frame_bbox
             if final_frame_bbox is None:
                 final_frame_bbox = [0,0,0,0] # Keep the structre of bbox vector 4 dims (dummy bbox), even if no bbox
             new_frame["observation.environment_state"] = np.array(final_frame_bbox, dtype=np.float32)
-
+            
+            str_task = src_dataset.meta.tasks[src_dataset.meta.tasks.task_index == _as_int(frame["task_index"])].index[0]
+            new_frame['task'] = str_task
+            # new_frame['timestamp'] = float(frame["timestamp"][0] if isinstance(frame["timestamp"], (list, tuple, np.ndarray)) else getattr(frame["timestamp"], "item", lambda: frame["timestamp"])())
+            
             dst_dataset.add_frame(
-                new_frame,
-                task=src_dataset.meta.tasks[_as_int(frame["task_index"])],
-                timestamp=float(frame["timestamp"][0] if isinstance(frame["timestamp"], (list, tuple, np.ndarray)) else getattr(frame["timestamp"], "item", lambda: frame["timestamp"])()),
+                new_frame                
             )
+        
+        if skip_episode:
+            continue
+
         dst_dataset.save_episode()
         episode_counter += 1
         
@@ -517,7 +542,7 @@ def main():
     p.add_argument("--camera", "-c", required=True, help="camera key to read from dataset.meta.camera_keys for extract first frame for bbox detection")
     p.add_argument("--object-prompt", "-o", default=None, help="Optional object prompt / object name")
     p.add_argument("--api-key", help="API key for the selected bbox detector. If not provided, the detector will try to read from its specific environment variable (e.g., GEMINI_API_KEY, MOONDREAM_API_KEY).")
-    p.add_argument("--out", default="out_bbox.png", help="Output annotated image path")
+    p.add_argument("--out_path", default="out_bbox.png", help="Output annotated image path")
     p.add_argument("--bbox-detector", default="gemini", choices=["gemini", "moondream"], help="Bounding box detector to use.")
     p.add_argument("--tracker", default="none", choices=["none", "csrt"], help="Tracker to propagate bbox across frames.")
     p.add_argument("--out-repo-id", help="name of the new repo e.g Shani123/pick_up_glass_bbox. Saved in ")
@@ -531,6 +556,7 @@ def main():
     )
     p.add_argument("--max-episodes", type=int, default=None, 
                    help="Max episodes to convert (for testing; if not provided, converts all episodes)")
+    p.add_argument("--remove-episodes-no-detect", action="store_true", help="If provided, skip episodes where no bbox is detected in the first frame.")
     args = p.parse_args()
 
     # API key for object prompt extraction (always uses Gemini)
@@ -617,40 +643,31 @@ def main():
         bbox_provider = get_bbox_provider(args.bbox_detector)
         detections, parsed = bbox_provider.detect(pil_img, object_prompt)
     except Exception as e:
-        print("Error calling bounding box detector (provider):", e)
+        print(f'Error calling bounding box detector {args.bbox_detector}:', e)
         raise
-
-    if not detections:
-        print("No detections returned by Gemini.")
-        print("Full parsed JSON:")
+        
+    if detections:
+        primary = detections[0]
+        print("Primary detection (rescaled to pixels):")
+        print(json.dumps(primary, indent=2))        
+        # 1) Save annotated image (requirement for first frame)    
+        # TODO: Refactor to a function: bbox_pixels normalization
+        bbox_pixels = primary["box_pixels"]  # [x1, y1, x2, y2]
+        x1_orig, y1_orig, x2_orig, y2_orig = bbox_pixels
+        # Ensure coordinates are in the right order - min x, min y, max x, max y (draw requires it)
+        x1, x2 = sorted([x1_orig, x2_orig])
+        y1, y2 = sorted([y1_orig, y2_orig])
+        bbox_pixels = [x1, y1, x2, y2]    
+        draw_bbox_and_save(pil_img, tuple(bbox_pixels), args.out_path)
+        print(f"Saved visualization to: {args.out_path}")
+    else:
+        print(f'No detections returned by {args.bbox_detector}.')
+        print("detector JSON response:")
         print(json.dumps(parsed, indent=2))
-        sys.exit(0)
+        draw_bbox_and_save(pil_img, tuple([1,1,2,2]), args.out_path)
+        print(f'Saved first frame with NO detections to: {args.out_path}')
+        
 
-    primary = detections[0]
-    print("Primary detection (rescaled to pixels):")
-    print(json.dumps(primary, indent=2))
-
-    
-    # 1) Save annotated image (requirement for first frame)
-    out_path = args.out
-    # TODO: Refactor to a function: bbox_pixels normalization
-    bbox_pixels = primary["box_pixels"]  # [x1, y1, x2, y2]
-    x1_orig, y1_orig, x2_orig, y2_orig = bbox_pixels
-    # Ensure coordinates are in the right order - min x, min y, max x, max y (draw requires it)
-    x1, x2 = sorted([x1_orig, x2_orig])
-    y1, y2 = sorted([y1_orig, y2_orig])
-    bbox_pixels = [x1, y1, x2, y2]    
-    draw_bbox_and_save(pil_img, tuple(bbox_pixels), out_path)
-    print(f"Saved visualization to: {out_path}")
-
-    # Instantiate tracker after bbox is extracted (as requested)
-    if args.tracker and args.tracker.lower() != "none":
-        try:
-            from tracking_providers.tracking_provider_factory import get_tracking_provider as _get_tracking_provider
-            _ = _get_tracking_provider(args.tracker, bbox_pixels)
-            print(f"Tracker '{args.tracker}' instantiated.")
-        except Exception as e:
-            print(f"Warning: could not instantiate tracker '{args.tracker}': {e}")
 
     # 2) Convert the dataset to bboxes (if requested)
     if args.out_repo_id:    
@@ -663,7 +680,8 @@ def main():
             camera_key=args.camera,
             tracker_name=args.tracker,
             annotate_images=args.annotate_image,
-            max_episodes=args.max_episodes  # pass the new cmdline argument
+            max_episodes=args.max_episodes,  # pass the new cmdline argument
+            remove_episodes_no_detect=args.remove_episodes_no_detect,
         )
         print(f"Done. Modified dataset includes 'observation.environment_state' and camera columns removed. Saved in {ds_new.root}")
         # Upload to HF if requested

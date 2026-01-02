@@ -7,13 +7,13 @@ pipeline, then checks if the custom step is already present, and if not,
 injects it at the beginning.
 """
 import logging
-
+from pathlib import Path
 # Import the original script and the specific function we want to patch
 import lerobot.scripts.lerobot_record as original_record_script
 from lerobot.policies.factory import make_pre_post_processors as original_make_processors
 
 # Import the components needed for the check and injection
-from lerobot.processors.bbox_processor import BboxProcessorStep
+from my_lerobot.processors.bbox_processor import BboxProcessorStep
 
 
 def custom_make_processors_with_bbox_injection(*args, **kwargs):
@@ -33,12 +33,18 @@ def custom_make_processors_with_bbox_injection(*args, **kwargs):
     if not already_has_bbox:
         logging.info("[MONKEY-PATCH] BboxProcessorStep not found. Injecting it at the beginning.")
         
-        # NOTE: This path is hardcoded for this example. You may need to make this
-        # configurable if you have different bounding box processor configs.
         bbox_config_path = "configs/custom_processors/bbox_preprocessor_cfg.json"
+        base_dir = Path(__file__).resolve().parent
+
+        # The config folder is a sibling of processors/, so go one level up
+        abs_path = (base_dir.parent / bbox_config_path).resolve()
+
+        if not abs_path.exists():
+            raise FileNotFoundError(f"Config file not found: {abs_path}")
+            
         logging.info(f"[MONKEY-PATCH] Loading BboxProcessorStep from: {bbox_config_path}")
+        bbox_step = BboxProcessorStep.from_json(abs_path)
         
-        bbox_step = BboxProcessorStep.from_json(bbox_config_path)
 
         # By injecting the step first, we add new observation data (e.g., bounding boxes)
         # before any other processing happens.        
