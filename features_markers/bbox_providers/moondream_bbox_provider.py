@@ -169,5 +169,5 @@ class MoondreamVLMProvider(BBoxProvider):
                         "path": path_str,
                     }
                 )
-
+        #print(f'Moondream: segment() predictions: {all_predictions}' )
         return {"predictions": all_predictions, "points": all_points}
