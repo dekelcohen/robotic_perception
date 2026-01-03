@@ -24,17 +24,9 @@ from torch import Tensor
 from lerobot.configs.types import PipelineFeatureType, PolicyFeature
 from lerobot.utils.constants import OBS_ENV_STATE
 
-# Imports from the user's robotic_perception library.
-# Please ensure this library is in your PYTHONPATH.
 from bbox_providers.bbox_provider_factory import get_bbox_provider
-from convert_lerobot_dataset_to_bbox import (
-    FrameProcessor,
-    FrameProcessorOptions,
-    tensor_to_pil,
-)
-from tracking_providers.tracking_provider_factory import (
-    get_tracking_provider,
-)
+from convert_lerobot_dataset_to_bbox import FrameProcessor, tensor_to_pil
+from tracking_providers.tracking_provider_factory import get_tracking_provider
 
 from lerobot.processor.pipeline import ObservationProcessorStep, ProcessorStepRegistry
 
