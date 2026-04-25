@@ -1,9 +1,12 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
-from PIL import Image
+from PIL import Image, ImageDraw
 import os
-import json
+import numpy as np
+
+# Specialized SVG path parser (preferred)
+from svgpathtools import parse_path
 
 from .bbox_providers import BBoxProvider
 
@@ -20,6 +23,51 @@ def _ensure_pil(image_or_path: Any) -> Image.Image:
         return Image.open(image_or_path).convert("RGB")  # type: ignore[arg-type]
     except Exception as e:
         raise ValueError(f"Unsupported image input type: {type(image_or_path).__name__}") from e
+
+
+def _polygon_mask(points_px: List[Tuple[int, int]], W: int, H: int) -> np.ndarray:
+    """Rasterize a polygon (in pixel coords) into a 0/1 mask of shape (H, W)."""
+    mask_img = Image.new("L", (W, H), 0)
+    draw = ImageDraw.Draw(mask_img)
+    try:
+        draw.polygon(points_px, outline=1, fill=1)
+    except Exception as e:
+        print(f"Moondream: polygon rasterization failed: {e}")
+        return np.zeros((H, W), dtype=np.uint8)
+    return np.array(mask_img, dtype=np.uint8)
+
+
+def _mask_from_path_svg(path_val: Any, W: int, H: int) -> np.ndarray | None:
+    """Build mask from an SVG path string using svgpathtools.
+    Samples points along segments and fills the polygon.
+    """
+    
+    
+    path_obj = parse_path(str(path_val))
+    
+    points_px: List[Tuple[int, int]] = []
+    try:
+        for seg in path_obj:
+            # 64 samples per segment for reasonable fidelity
+            for t in np.linspace(0.0, 1.0, 64, dtype=float):
+                z = seg.point(t)
+                x = float(z.real)
+                y = float(z.imag)
+                # Clamp normalized coordinates to [0,1]
+                x = max(0.0, min(1.0, x))
+                y = max(0.0, min(1.0, y))
+                points_px.append((int(round(x * W)), int(round(y * H))))
+    except Exception as e:
+        print(f"Moondream: SVG path sampling failed: {e}")
+        return None
+    if len(points_px) < 3:
+        return None
+    return _polygon_mask(points_px, W, H)
+
+
+def _mask_from_path(path_val: Any, W: int, H: int) -> np.ndarray | None:
+    """High-level path-to-mask builder using only SVG parsing."""
+    return _mask_from_path_svg(path_val, W, H)
 
 
 class MoondreamVLMProvider(BBoxProvider):
@@ -129,10 +177,10 @@ class MoondreamVLMProvider(BBoxProvider):
                     print(f"Moondream: segment() failed for prompt='{prompt}' at point={p}: {e}")
                     continue
 
-                path_str = None
+                path_val = None
                 bbox_norm = None
                 if isinstance(seg_res, dict):
-                    path_str = seg_res.get("path")
+                    path_val = seg_res.get("path")
                     bbox = seg_res.get("bbox") or {}
                     try:
                         x_min = float(bbox.get("x_min"))
@@ -143,10 +191,17 @@ class MoondreamVLMProvider(BBoxProvider):
                     except Exception:
                         bbox_norm = None
 
+                # Build seg_mask only from SVG path
+                seg_mask = None
+                try:
+                    if path_val is not None:
+                        seg_mask = _mask_from_path(path_val, W, H)
+                except Exception as e:
+                    print(f"Moondream: seg_mask from path failed: {e}")
+                    seg_mask = None
+
                 if bbox_norm is None:
-                    px, py = float(p["x"]), float(p["y"])\
-                    
-                    
+                    px, py = float(p["x"]), float(p["y"])            
                     eps = 2.0 / max(1.0, float(W))
                     bbox_norm = (
                         max(0.0, py - eps),
@@ -160,14 +215,14 @@ class MoondreamVLMProvider(BBoxProvider):
                 y1 = max(0, min(H, int(round(y_min * H))))
                 x2 = max(0, min(W, int(round(x_max * W))))
                 y2 = max(0, min(H, int(round(y_max * H))))
-
+                
                 all_predictions.append(
                     {
                         "class": str(prompt),
                         "bbox_norm": [y_min, x_min, y_max, x_max],
                         "bbox_pixels": [x1, y1, x2, y2],
-                        "path": path_str,
+                        "path": path_val,
+                        "seg_mask": seg_mask,
                     }
                 )
-        #print(f'Moondream: segment() predictions: {all_predictions}' )
         return {"predictions": all_predictions, "points": all_points}
