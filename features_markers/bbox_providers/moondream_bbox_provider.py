@@ -25,6 +25,58 @@ def _ensure_pil(image_or_path: Any) -> Image.Image:
         raise ValueError(f"Unsupported image input type: {type(image_or_path).__name__}") from e
 
 
+
+def _normalize_ref(ref: List[float], W: int, H: int):
+    """
+    Normalize a spatial reference to (kind, values) with kind in {"point", "bbox"}.
+    - Accepts normalized refs (0..1) or pixel refs within image bounds.
+    - Raises ValueError with a descriptive message if the ref length is not 2 or 4,
+      or if any coordinate is out of bounds.
+    """
+    try:
+        vals = [float(v) for v in ref]
+    except Exception:
+        raise ValueError(f"spatial_ref must contain numeric values; got: {ref}")
+
+    if len(vals) == 2:
+        x, y = vals
+        is_pixel = max(abs(x), abs(y)) > 1.0
+        if is_pixel:
+            if not (0.0 <= x <= float(W)):
+                raise ValueError(f"Point x out of range: {x} not in [0,{W}] for image width={W}.")
+            if not (0.0 <= y <= float(H)):
+                raise ValueError(f"Point y out of range: {y} not in [0,{H}] for image height={H}.")
+            x = x / float(W)
+            y = y / float(H)
+        else:
+            if not (0.0 <= x <= 1.0):
+                raise ValueError(f"Normalized point x out of range: {x} not in [0,1].")
+            if not (0.0 <= y <= 1.0):
+                raise ValueError(f"Normalized point y out of range: {y} not in [0,1].")
+        return ("point", [x, y])
+
+    if len(vals) == 4:
+        x1, y1, x2, y2 = vals
+        is_pixel = max(abs(x1), abs(y1), abs(x2), abs(y2)) > 1.0
+        if is_pixel:
+            if not (0.0 <= x1 <= float(W)) or not (0.0 <= x2 <= float(W)):
+                raise ValueError(f"Box x values out of range: [{x1}, {x2}] not within [0,{W}] for image width={W}.")
+            if not (0.0 <= y1 <= float(H)) or not (0.0 <= y2 <= float(H)):
+                raise ValueError(f"Box y values out of range: [{y1}, {y2}] not within [0,{H}] for image height={H}.")
+            x1 /= float(W); x2 /= float(W)
+            y1 /= float(H); y2 /= float(H)
+        else:
+            for label, v in (("x1", x1), ("y1", y1), ("x2", x2), ("y2", y2)):
+                if not (0.0 <= v <= 1.0):
+                    raise ValueError(f"Normalized {label} out of range: {v} not in [0,1].")
+        x_min, x_max = (x1, x2) if x1 <= x2 else (x2, x1)
+        y_min, y_max = (y1, y2) if y1 <= y2 else (y2, y1)
+        return ("bbox", [x_min, y_min, x_max, y_max])
+
+    raise ValueError(
+        f"Invalid spatial_ref length: expected 2 (point) or 4 (bbox); got {len(vals)} for ref: {ref}."
+    )
+
 def _polygon_mask(points_px: List[Tuple[int, int]], W: int, H: int) -> np.ndarray:
     """Rasterize a polygon (in pixel coords) into a 0/1 mask of shape (H, W)."""
     mask_img = Image.new("L", (W, H), 0)
@@ -142,39 +194,65 @@ class MoondreamVLMProvider(BBoxProvider):
     # ----------------------------
     # Segmentation (new API)
     # ----------------------------
-    def segment(self, image_or_path: Any, prompt_classes: List[str]) -> Any:
+    def segment(self, image_or_path: Any, prompt_classes: List[str], spatial_refs: List[List[float]] = None) -> Any:
+        """
+        Segment each class in `prompt_classes` using Moondream.
+
+        - If `spatial_refs` is provided, it is used directly as Moondream's
+          `spatial_refs` argument for every prompt. Each ref can be either:
+            [x, y]              normalized point (0..1), or pixel point (>1); or
+            [x1, y1, x2, y2]    normalized box, or pixel box (>1 values).
+          Pixel refs are normalized to 0..1 using image size.
+        - If `spatial_refs` is None (default), falls back to the existing
+          behavior: call `.point()` to get candidates and then call `.segment()`
+          per point.
+        """
         image = _ensure_pil(image_or_path)
         W, H = image.size
         model = self._model_lazy()
 
         all_predictions: List[Dict[str, Any]] = []
         all_points: Dict[str, List[Dict[str, float]]] = {}
-
         for prompt in (prompt_classes or []):
-            # 1) points
-            try:
-                point_result = model.point(image, prompt)
-                pts = point_result.get("points", []) if isinstance(point_result, dict) else []
-            except Exception as e:
-                print(f"Moondream: point() failed for prompt='{prompt}': {e}")
-                pts = []
+            refs_for_prompt = []
 
-            pts_norm: List[Dict[str, float]] = []
-            for p in pts:
+            if spatial_refs:
+                norm_refs = [ _normalize_ref(ref, W, H) for ref in spatial_refs ]
+                all_points[prompt] = [
+                    {"x": v[0], "y": v[1]} for (kind, v) in norm_refs if kind == "point"
+                ]
+                refs_for_prompt = norm_refs
+            else:
                 try:
-                    pts_norm.append({"x": float(p["x"]), "y": float(p["y"])})
-                except Exception:
-                    continue
-            all_points[prompt] = pts_norm
-            if not pts_norm:
+                    point_result = model.point(image, prompt)
+                    pts = point_result.get("points", []) if isinstance(point_result, dict) else []
+                except Exception as e:
+                    print(f"Moondream: point() failed for prompt='{prompt}': {e}")
+                    pts = []
+
+                pts_norm: List[Dict[str, float]] = []
+                for p in pts:
+                    try:
+                        pts_norm.append({"x": float(p["x"]), "y": float(p["y"])})
+                    except Exception:
+                        continue
+                all_points[prompt] = pts_norm
+                refs_for_prompt = [("point", [p["x"], p["y"]]) for p in pts_norm]
+
+            if not refs_for_prompt:
                 continue
 
-            # 2) segment per point
-            for p in pts_norm:
+            for (kind, v) in refs_for_prompt:
+                if kind == "point":
+                    sr = [v]
+                else:
+                    x_min, y_min, x_max, y_max = v
+                    sr = [[x_min, y_min, x_max, y_max]]
+
                 try:
-                    seg_res = model.segment(image, prompt, spatial_refs=[[p["x"], p["y"]]])
+                    seg_res = model.segment(image, prompt, spatial_refs=sr)
                 except Exception as e:
-                    print(f"Moondream: segment() failed for prompt='{prompt}' at point={p}: {e}")
+                    print(f"Moondream: segment() failed for prompt='{prompt}' with spatial_ref={sr}: {e}")
                     continue
 
                 path_val = None
@@ -201,14 +279,18 @@ class MoondreamVLMProvider(BBoxProvider):
                     seg_mask = None
 
                 if bbox_norm is None:
-                    px, py = float(p["x"]), float(p["y"])            
-                    eps = 2.0 / max(1.0, float(W))
-                    bbox_norm = (
-                        max(0.0, py - eps),
-                        max(0.0, px - eps),
-                        min(1.0, py + eps),
-                        min(1.0, px + eps),
-                    )
+                    if kind == "point":
+                        px, py = v
+                        eps = 2.0 / max(1.0, float(W))
+                        bbox_norm = (
+                            max(0.0, py - eps),
+                            max(0.0, px - eps),
+                            min(1.0, py + eps),
+                            min(1.0, px + eps),
+                        )
+                    else:
+                        y_min = v[1]; x_min = v[0]; y_max = v[3]; x_max = v[2]
+                        bbox_norm = (y_min, x_min, y_max, x_max)
 
                 y_min, x_min, y_max, x_max = bbox_norm
                 x1 = max(0, min(W, int(round(x_min * W))))
@@ -226,3 +308,7 @@ class MoondreamVLMProvider(BBoxProvider):
                     }
                 )
         return {"predictions": all_predictions, "points": all_points}
+
+
+
+
