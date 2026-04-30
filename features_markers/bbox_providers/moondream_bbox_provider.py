@@ -89,37 +89,82 @@ def _polygon_mask(points_px: List[Tuple[int, int]], W: int, H: int) -> np.ndarra
     return np.array(mask_img, dtype=np.uint8)
 
 
-def _mask_from_path_svg(path_val: Any, W: int, H: int) -> np.ndarray | None:
+def _mask_from_path_svg(
+    path_val: Any,
+    W: int,
+    H: int,
+    bbox_norm: Tuple[float, float, float, float] | None = None,
+) -> np.ndarray | None:
     """Build mask from an SVG path string using svgpathtools.
-    Samples points along segments and fills the polygon.
+    Moondream segment paths are normalized to [0,1] relative to the bbox.
+    We therefore map each sampled path point into full-image coordinates via bbox.
     """
-    
-    
+
     path_obj = parse_path(str(path_val))
-    
+    if len(path_obj) == 0:
+        return None
+
+    if bbox_norm is not None:
+        y_min, x_min, y_max, x_max = bbox_norm
+        x_min = max(0.0, min(1.0, float(x_min)))
+        y_min = max(0.0, min(1.0, float(y_min)))
+        x_max = max(0.0, min(1.0, float(x_max)))
+        y_max = max(0.0, min(1.0, float(y_max)))
+        if x_max <= x_min or y_max <= y_min:
+            return None
+    else:
+        x_min, y_min, x_max, y_max = 0.0, 0.0, 1.0, 1.0
+
+    bw = x_max - x_min
+    bh = y_max - y_min
+    merged = np.zeros((H, W), dtype=np.uint8)
     points_px: List[Tuple[int, int]] = []
+    prev_end = None
+
+    def _flush_polygon(poly_pts: List[Tuple[int, int]]) -> None:
+        nonlocal merged
+        if len(poly_pts) < 3:
+            return
+        merged = np.maximum(merged, _polygon_mask(poly_pts, W, H))
+
     try:
         for seg in path_obj:
+            if prev_end is not None and abs(seg.start - prev_end) > 1e-9:
+                _flush_polygon(points_px)
+                points_px = []
+
             # 64 samples per segment for reasonable fidelity
             for t in np.linspace(0.0, 1.0, 64, dtype=float):
+                if t == 0.0 and points_px:
+                    continue
                 z = seg.point(t)
-                x = float(z.real)
-                y = float(z.imag)
-                # Clamp normalized coordinates to [0,1]
-                x = max(0.0, min(1.0, x))
-                y = max(0.0, min(1.0, y))
-                points_px.append((int(round(x * W)), int(round(y * H))))
+                local_x = max(0.0, min(1.0, float(z.real)))
+                local_y = max(0.0, min(1.0, float(z.imag)))
+                x_img = x_min + local_x * bw
+                y_img = y_min + local_y * bh
+                px = max(0, min(W - 1, int(round(x_img * (W - 1)))))
+                py = max(0, min(H - 1, int(round(y_img * (H - 1)))))
+                points_px.append((px, py))
+
+            prev_end = seg.end
     except Exception as e:
         print(f"Moondream: SVG path sampling failed: {e}")
         return None
-    if len(points_px) < 3:
+
+    _flush_polygon(points_px)
+    if not np.any(merged):
         return None
-    return _polygon_mask(points_px, W, H)
+    return merged
 
 
-def _mask_from_path(path_val: Any, W: int, H: int) -> np.ndarray | None:
+def _mask_from_path(
+    path_val: Any,
+    W: int,
+    H: int,
+    bbox_norm: Tuple[float, float, float, float] | None = None,
+) -> np.ndarray | None:
     """High-level path-to-mask builder using only SVG parsing."""
-    return _mask_from_path_svg(path_val, W, H)
+    return _mask_from_path_svg(path_val, W, H, bbox_norm=bbox_norm)
 
 
 class MoondreamVLMProvider(BBoxProvider):
@@ -269,15 +314,6 @@ class MoondreamVLMProvider(BBoxProvider):
                     except Exception:
                         bbox_norm = None
 
-                # Build seg_mask only from SVG path
-                seg_mask = None
-                try:
-                    if path_val is not None:
-                        seg_mask = _mask_from_path(path_val, W, H)
-                except Exception as e:
-                    print(f"Moondream: seg_mask from path failed: {e}")
-                    seg_mask = None
-
                 if bbox_norm is None:
                     if kind == "point":
                         px, py = v
@@ -291,6 +327,15 @@ class MoondreamVLMProvider(BBoxProvider):
                     else:
                         y_min = v[1]; x_min = v[0]; y_max = v[3]; x_max = v[2]
                         bbox_norm = (y_min, x_min, y_max, x_max)
+
+                # Build seg_mask from SVG path in bbox-relative coordinates.
+                seg_mask = None
+                try:
+                    if path_val is not None:
+                        seg_mask = _mask_from_path(path_val, W, H, bbox_norm=bbox_norm)
+                except Exception as e:
+                    print(f"Moondream: seg_mask from path failed: {e}")
+                    seg_mask = None
 
                 y_min, x_min, y_max, x_max = bbox_norm
                 x1 = max(0, min(W, int(round(x_min * W))))
